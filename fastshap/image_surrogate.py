@@ -7,7 +7,8 @@ from fastshap.image_imputers import ImageImputer
 from fastshap.utils import UniformSampler, DatasetRepeat
 from tqdm.auto import tqdm
 from copy import deepcopy
-
+import math
+import os
 
 def validate(surrogate, loss_fn, data_loader):
     '''
@@ -34,6 +35,48 @@ def validate(surrogate, loss_fn, data_loader):
 
     return mean_loss
 
+def validate_scl(surrogate, loss_fn, data_loader):
+    '''
+    Calculate mean validation loss.
+
+    Args:
+      loss_fn: loss function.
+      data_loader: data loader.
+    '''
+    with torch.no_grad():
+        # Setup.
+        device = next(surrogate.surrogate.parameters()).device
+        mean_loss = 0
+        N = 0
+
+        for x, y, S in data_loader:
+            x = x.to(device)
+            y = y.to(device)
+            S = S.to(device)
+            features = surrogate(x, S)
+
+            # compute loss
+            # sID: COPIED FROM scl
+            bsz = y.shape[0]
+            f1, f2 = torch.split(features, [bsz, bsz], dim=0)
+            features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
+            loss = loss_fn(features, y)
+
+            N += len(x)
+            mean_loss += len(x) * (loss - mean_loss) / N
+
+    return mean_loss
+
+def save_model(model, optimizer, opt, epoch, save_file):
+    print('==> Saving...')
+    state = {
+        'opt': opt,
+        'model': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'epoch': epoch,
+    }
+    torch.save(state, save_file)
+    del state
 
 def generate_labels(dataset, model, batch_size, num_workers):
     '''
@@ -244,12 +287,13 @@ class ImageSurrogate(ImageImputer):
                              batch_size,
                              max_epochs,
                              loss_fn,
+                             opt,
                              validation_samples=1,
                              validation_batch_size=None,
-                             lr=1e-3,
+                             lr=0.05,
                              min_lr=1e-5,
                              lr_factor=0.5,
-                             lookback=5,
+                             lookback=10,
                              training_seed=None,
                              validation_seed=None,
                              num_workers=0,
@@ -270,6 +314,7 @@ class ImageSurrogate(ImageImputer):
           batch_size: minibatch size.
           max_epochs: max number of training epochs.
           loss_fn: loss function (e.g., fastshap.KLDivLoss)
+          opt: ARguments
           validation_samples: number of samples per validation example.
           validation_batch_size: validation minibatch size.
           lr: initial learning rate.
@@ -282,6 +327,10 @@ class ImageSurrogate(ImageImputer):
           bar: whether to show progress bar.
           verbose: verbosity.
         '''
+        from scl.util import AverageMeter
+        import time
+        import sys
+
         # Set up train dataset.
         if isinstance(train_data, np.ndarray):
             train_data = torch.tensor(train_data, dtype=torch.float32)
@@ -348,199 +397,25 @@ class ImageSurrogate(ImageImputer):
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, factor=lr_factor, patience=lookback // 2, min_lr=min_lr,
             verbose=verbose)
-        best_loss = validate(self, loss_fn, val_loader).item()
-        best_epoch = 0
-        best_model = deepcopy(surrogate)
-        loss_list = [best_loss]
+        #best_loss = validate_scl(self, loss_fn, val_loader).item()
+        #best_epoch = 0
+        #best_model = deepcopy(surrogate)
+        #loss_list = [best_loss]
         if training_seed is not None:
             torch.manual_seed(training_seed)
 
+        batch_time = AverageMeter()
+        data_time = AverageMeter()
+        losses = AverageMeter()
+
+        end = time.time()
         for epoch in range(max_epochs):
+            data_time.update(time.time() - end)
+            self.adjust_learning_rate(opt, optimizer, epoch)
             # Batch iterable.
-            if bar:
-                batch_iter = tqdm(train_loader, desc='Training epoch')
-            else:
-                batch_iter = train_loader
+            batch_iter = train_loader
 
-            for (x,) in batch_iter:
-                # Prepare data.
-                x = x.to(device)
-
-                # Get original model prediction.
-                with torch.no_grad():
-                    y = original_model(x)
-
-                # Generate subsets.
-                S = sampler.sample(batch_size).to(device=device)
-
-                # Make predictions.
-                pred = self.__call__(x, S)
-                loss = loss_fn(pred, y)
-
-                # Optimizer step.
-                loss.backward()
-                optimizer.step()
-                surrogate.zero_grad()
-
-            # Evaluate validation loss.
-            self.surrogate.eval()
-            val_loss = validate(self, loss_fn, val_loader).item()
-            self.surrogate.train()
-
-            # Print progress.
-            if verbose:
-                print('----- Epoch = {} -----'.format(epoch + 1))
-                print('Val loss = {:.4f}'.format(val_loss))
-                print('')
-            scheduler.step(val_loss)
-            loss_list.append(val_loss)
-
-            # Check if best model.
-            if val_loss < best_loss:
-                best_loss = val_loss
-                best_model = deepcopy(surrogate)
-                best_epoch = epoch
-                if verbose:
-                    print('New best epoch, loss = {:.4f}'.format(val_loss))
-                    print('')
-            elif epoch - best_epoch == lookback:
-                if verbose:
-                    print('Stopping early')
-                break
-
-        # Clean up.
-        for param, best_param in zip(surrogate.parameters(),
-                                     best_model.parameters()):
-            param.data = best_param.data
-        self.loss_list = loss_list
-        self.surrogate.eval()
-
-    def train_original_model_scl(self,
-                             train_data,
-                             val_data,
-                             original_model,
-                             batch_size,
-                             max_epochs,
-                             loss_fn,
-                             validation_samples=1,
-                             validation_batch_size=None,
-                             lr=1e-3,
-                             min_lr=1e-5,
-                             lr_factor=0.5,
-                             lookback=5,
-                             training_seed=None,
-                             validation_seed=None,
-                             num_workers=0,
-                             bar=False,
-                             verbose=False):
-        '''
-        Train surrogate model with labels provided by the original model. This
-        approach is designed for when data augmentations make the data loader
-        non-deterministic, and labels (the original model's predictions) cannot
-        be generated prior to training.
-
-        Args:
-          train_data: training data with inputs only (np.ndarray, torch.Tensor,
-            torch.utils.data.Dataset).
-          val_data: validation data with inputs only (np.ndarray, torch.Tensor,
-            torch.utils.data.Dataset).
-          original_model: original predictive model (e.g., torch.nn.Module).
-          batch_size: minibatch size.
-          max_epochs: max number of training epochs.
-          loss_fn: loss function (e.g., fastshap.KLDivLoss)
-          validation_samples: number of samples per validation example.
-          validation_batch_size: validation minibatch size.
-          lr: initial learning rate.
-          min_lr: minimum learning rate.
-          lr_factor: learning rate decrease factor.
-          lookback: lookback window for early stopping.
-          training_seed: random seed for training.
-          validation_seed: random seed for generating validation data.
-          num_workers: number of worker threads in data loader.
-          bar: whether to show progress bar.
-          verbose: verbosity.
-        '''
-        # Set up train dataset.
-        if isinstance(train_data, np.ndarray):
-            train_data = torch.tensor(train_data, dtype=torch.float32)
-
-        if isinstance(train_data, torch.Tensor):
-            train_set = TensorDataset(train_data)
-        elif isinstance(train_data, Dataset):
-            train_set = train_data
-        else:
-            raise ValueError('train_data must be either tensor or a '
-                             'PyTorch Dataset')
-
-        # Set up train data loader.
-        random_sampler = RandomSampler(
-            train_set, replacement=True,
-            num_samples=int(np.ceil(len(train_set) / batch_size))*batch_size)
-        batch_sampler = BatchSampler(
-            random_sampler, batch_size=batch_size, drop_last=True)
-        train_loader = DataLoader(train_set, batch_sampler=batch_sampler,
-                                  pin_memory=True, num_workers=num_workers)
-
-        # Set up validation dataset.
-        sampler = UniformSampler(self.num_players)
-        if validation_seed is not None:
-            torch.manual_seed(validation_seed)
-        S_val = sampler.sample(len(val_data) * validation_samples)
-        if validation_batch_size is None:
-            validation_batch_size = batch_size
-
-        if isinstance(val_data, np.ndarray):
-            val_data = torch.tensor(val_data, dtype=torch.float32)
-
-        if isinstance(val_data, torch.Tensor):
-            # Generate validation labels.
-            y_val = generate_labels(TensorDataset(val_data), original_model,
-                                    validation_batch_size, num_workers)
-            y_val_repeat = y_val.repeat(
-                validation_samples, *[1 for _ in y_val.shape[1:]])
-
-            # Create dataset.
-            val_data_repeat = val_data.repeat(validation_samples, 1, 1, 1)
-            val_set = TensorDataset(val_data_repeat, y_val_repeat, S_val)
-        elif isinstance(val_data, Dataset):
-            # Generate validation labels.
-            y_val = generate_labels(val_data, original_model,
-                                    validation_batch_size, num_workers)
-            y_val_repeat = y_val.repeat(
-                validation_samples, *[1 for _ in y_val.shape[1:]])
-
-            # Create dataset.
-            val_set = DatasetRepeat(
-                [val_data, TensorDataset(y_val_repeat, S_val)])
-        else:
-            raise ValueError('val_data must be either tuple of tensors or a '
-                             'PyTorch Dataset')
-
-        val_loader = DataLoader(val_set, batch_size=validation_batch_size,
-                                pin_memory=True, num_workers=num_workers)
-
-        # Setup for training.
-        surrogate = self.surrogate
-        device = next(surrogate.parameters()).device
-        optimizer = optim.Adam(surrogate.parameters(), lr=lr)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, factor=lr_factor, patience=lookback // 2, min_lr=min_lr,
-            verbose=verbose)
-        best_loss = validate(self, loss_fn, val_loader).item()
-        best_epoch = 0
-        best_model = deepcopy(surrogate)
-        loss_list = [best_loss]
-        if training_seed is not None:
-            torch.manual_seed(training_seed)
-
-        for epoch in range(max_epochs):
-            # Batch iterable.
-            if bar:
-                batch_iter = tqdm(train_loader, desc='Training epoch')
-            else:
-                batch_iter = train_loader
-
-            for (x,) in batch_iter:
+            for idx, (x,) in enumerate(batch_iter):
                 # Prepare data.
                 # sid-scl: Below line is for scl implementation
                 # x = torch.cat([x[0], x[1]], dim=0)
@@ -554,28 +429,50 @@ class ImageSurrogate(ImageImputer):
                 S = sampler.sample(batch_size).to(device=device)
 
                 # Make predictions.
-                pred = self.__call__(x, S)
-                loss = loss_fn(pred, y)
+                features = self.__call__(x, S)
+                # compute loss
+                # sID: COPIED FROM scl
+                bsz = y.shape[0]
+                f1, f2 = torch.split(features, [bsz, bsz], dim=0)
+                features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
+                loss = loss_fn(features, y)
+
+                # update metric
+                losses.update(loss.item(), bsz)
 
                 # Optimizer step.
                 loss.backward()
                 optimizer.step()
                 surrogate.zero_grad()
 
-            # Evaluate validation loss.
-            self.surrogate.eval()
-            val_loss = validate(self, loss_fn, val_loader).item()
-            self.surrogate.train()
+                # measure elapsed time
+                batch_time.update(time.time() - end)
+                end = time.time()
 
-            # Print progress.
-            if verbose:
-                print('----- Epoch = {} -----'.format(epoch + 1))
-                print('Val loss = {:.4f}'.format(val_loss))
-                print('')
-            scheduler.step(val_loss)
-            loss_list.append(val_loss)
+                # Print progress.
+                if (idx + 1) % opt.print_freq == 0:
+                    print('Train: [{0}][{1}/{2}]\t'
+                        'BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                        'DT {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                        'loss {loss.val:.3f} ({loss.avg:.3f})'.format(
+                        epoch, idx + 1, len(train_loader), batch_time=batch_time,
+                        data_time=data_time, loss=losses))
+                sys.stdout.flush()
+
+            if epoch % opt.save_freq == 0:
+                save_file = os.path.join(
+                    opt.save_folder, 'ckpt_epoch_{epoch}.pth'.format(epoch=epoch))
+                save_model(surrogate, optimizer, opt, epoch, save_file)
+            # Evaluate validation loss.
+            #self.surrogate.eval()
+            #val_loss = validate_scl(self, loss_fn, val_loader).item()
+            #self.surrogate.train()
+
+            #scheduler.step(val_loss)
+            #loss_list.append(val_loss)
 
             # Check if best model.
+            '''
             if val_loss < best_loss:
                 best_loss = val_loss
                 best_model = deepcopy(surrogate)
@@ -587,13 +484,32 @@ class ImageSurrogate(ImageImputer):
                 if verbose:
                     print('Stopping early')
                 break
-
+            '''
         # Clean up.
+        '''
         for param, best_param in zip(surrogate.parameters(),
                                      best_model.parameters()):
             param.data = best_param.data
         self.loss_list = loss_list
         self.surrogate.eval()
+        '''
+
+        save_file = os.path.join("./scl_models", 'last.pth')
+        save_model(surrogate, optimizer, opt, opt.epochs, save_file)
+
+    def adjust_learning_rate(self, args, optimizer, epoch):
+        lr = args.learning_rate
+        if args.cosine:
+            eta_min = lr * (args.lr_decay_rate ** 3)
+            lr = eta_min + (lr - eta_min) * (
+                    1 + math.cos(math.pi * epoch / args.epochs)) / 2
+        else:
+            steps = np.sum(epoch > np.asarray(args.lr_decay_epochs))
+            if steps > 0:
+                lr = lr * (args.lr_decay_rate ** steps)
+
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
 
     def __call__(self, x, S):
         '''
@@ -605,3 +521,4 @@ class ImageSurrogate(ImageImputer):
         '''
         S = self.resize(S)
         return self.surrogate((x, S))
+

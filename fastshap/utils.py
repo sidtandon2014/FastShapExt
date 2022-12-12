@@ -71,10 +71,13 @@ class MaskLayer2dSCL(nn.Module):
             S = S.unsqueeze(1)
         x1 = x * S + self.value * (1 - S)
         x2 = x * (1-S)
-
-        x = torch.cat((x1,x2), dim = 0)
+        
         if self.append:
-            x = torch.cat((x, S), dim=1)
+            x1 = torch.cat((x1, S), dim=1)
+            x2 = torch.cat((x2, 1-S), dim=1)
+        
+        x = torch.cat((x1,x2), dim = 0)
+        
         return x
 
 
