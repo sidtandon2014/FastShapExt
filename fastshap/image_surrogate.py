@@ -281,24 +281,24 @@ class ImageSurrogate(ImageImputer):
         self.surrogate.eval()
 
     def train_original_model(self,
-                             train_data,
-                             val_data,
-                             original_model,
-                             batch_size,
-                             max_epochs,
-                             loss_fn,
-                             opt,
-                             validation_samples=1,
-                             validation_batch_size=None,
-                             lr=0.05,
-                             min_lr=1e-5,
-                             lr_factor=0.5,
-                             lookback=10,
-                             training_seed=None,
-                             validation_seed=None,
-                             num_workers=0,
-                             bar=False,
-                             verbose=False):
+                            train_data,
+                            val_data,
+                            original_model,
+                            batch_size,
+                            max_epochs,
+                            loss_fn,
+                            opt,
+                            validation_samples=1,
+                            validation_batch_size=None,
+                            lr=0.05,
+                            min_lr=1e-5,
+                            lr_factor=0.5,
+                            lookback=10,
+                            training_seed=None,
+                            validation_seed=None,
+                            num_workers=0,
+                            bar=False,
+                            verbose=False):
         '''
         Train surrogate model with labels provided by the original model. This
         approach is designed for when data augmentations make the data loader
@@ -306,26 +306,27 @@ class ImageSurrogate(ImageImputer):
         be generated prior to training.
 
         Args:
-          train_data: training data with inputs only (np.ndarray, torch.Tensor,
-            torch.utils.data.Dataset).
-          val_data: validation data with inputs only (np.ndarray, torch.Tensor,
-            torch.utils.data.Dataset).
-          original_model: original predictive model (e.g., torch.nn.Module).
-          batch_size: minibatch size.
-          max_epochs: max number of training epochs.
-          loss_fn: loss function (e.g., fastshap.KLDivLoss)
-          opt: ARguments
-          validation_samples: number of samples per validation example.
-          validation_batch_size: validation minibatch size.
-          lr: initial learning rate.
-          min_lr: minimum learning rate.
-          lr_factor: learning rate decrease factor.
-          lookback: lookback window for early stopping.
-          training_seed: random seed for training.
-          validation_seed: random seed for generating validation data.
-          num_workers: number of worker threads in data loader.
-          bar: whether to show progress bar.
-          verbose: verbosity.
+        opt: ARguments
+        train_data: training data with inputs only (np.ndarray, torch.Tensor,
+        torch.utils.data.Dataset).
+        val_data: validation data with inputs only (np.ndarray, torch.Tensor,
+        torch.utils.data.Dataset).
+        original_model: original predictive model (e.g., torch.nn.Module).
+        batch_size: minibatch size.
+        max_epochs: max number of training epochs.
+        loss_fn: loss function (e.g., fastshap.KLDivLoss)
+        
+        validation_samples: number of samples per validation example.
+        validation_batch_size: validation minibatch size.
+        lr: initial learning rate.
+        min_lr: minimum learning rate.
+        lr_factor: learning rate decrease factor.
+        lookback: lookback window for early stopping.
+        training_seed: random seed for training.
+        validation_seed: random seed for generating validation data.
+        num_workers: number of worker threads in data loader.
+        bar: whether to show progress bar.
+        verbose: verbosity.
         '''
         from scl.util import AverageMeter
         import time
@@ -409,7 +410,7 @@ class ImageSurrogate(ImageImputer):
         losses = AverageMeter()
 
         end = time.time()
-        for epoch in range(max_epochs):
+        for epoch in range(opt.epochs):
             data_time.update(time.time() - end)
             self.adjust_learning_rate(opt, optimizer, epoch)
             # Batch iterable.
@@ -423,7 +424,7 @@ class ImageSurrogate(ImageImputer):
 
                 # Get original model prediction.
                 with torch.no_grad():
-                    y = original_model(x[0])
+                    y = torch.argmax(original_model(x), dim = 1)
 
                 # Generate subsets.
                 S = sampler.sample(batch_size).to(device=device)
@@ -494,7 +495,7 @@ class ImageSurrogate(ImageImputer):
         self.surrogate.eval()
         '''
 
-        save_file = os.path.join("./scl_models", 'last.pth')
+        save_file = os.path.join(opt.save_folder, 'last.pth')
         save_model(surrogate, optimizer, opt, opt.epochs, save_file)
 
     def adjust_learning_rate(self, args, optimizer, epoch):

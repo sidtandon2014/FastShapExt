@@ -113,7 +113,7 @@ class ResNet(nn.Module):
 
         #Save last conv layer output
         # This is for testing purpose and can be removed later
-        np.save("/home/sidtandon/Sid/GitRepo/fastshap/notebooks/lastconv.npy", out.detach().cpu().numpy())
+        #np.save("/home/sidtandon/Sid/GitRepo/fastshap/notebooks/lastconv.npy", out.detach().cpu().numpy())
 
         # Output layer.
         if self.num_classes is not None:
