@@ -60,10 +60,11 @@ class MaskLayer2dSCL(nn.Module):
       append: whether to append the mask along channels dimension.
     '''
 
-    def __init__(self, value, append):
+    def __init__(self, value, append, include_second_coalition):
         super().__init__()
         self.value = value
         self.append = append
+        self.include_second_coalition = include_second_coalition
 
     def forward(self, input_tuple):
         x, S = input_tuple
@@ -76,7 +77,10 @@ class MaskLayer2dSCL(nn.Module):
             x1 = torch.cat((x1, S), dim=1)
             x2 = torch.cat((x2, 1-S), dim=1)
         
-        x = torch.cat((x1,x2), dim = 0)
+        if self.include_second_coalition:
+            x = torch.cat((x1,x2), dim = 0)
+        else:
+            x=x1
         
         return x
 
